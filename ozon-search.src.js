@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Ozon — фильтр оценки
+// @name         Ozon - Rating and Review Filters
 // @namespace    https://github.com/sashokey/ozon-search
-// @version      1.0.0
-// @description  Диапазон оценки после цены. Фильтрует загруженные карточки и новые товары при прокрутке.
+// @version      1.0.1
+// @description  Adds rating and review count ranges after the price filter. Filters loaded products and new items while scrolling.
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
 // @run-at       document-idle
