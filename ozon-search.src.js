@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Ozon - Rating and Review Filters
 // @namespace    https://github.com/sashokey/ozon-search
-// @version      1.0.1
-// @description  Adds rating and review count ranges after the price filter. Filters loaded products and new items while scrolling.
+// @version      1.1.0
+// @description  Adds rating and review ranges and a 30-minute delivery switch for Ozon Fresh. Filters loaded and newly loaded products.
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
 // @run-at       document-idle
@@ -17,9 +17,13 @@
   if (document.getElementById(ID + '-style')) return;
   const PRICE = '[filter-key="currency_price"], [filterkey="currency_price"]';
   const GRID = '[data-widget="tileGridDesktop"]';
-  const CARD = GRID + ' .tile-root';
+  const SURFACE = ':is(' + GRID + ', [data-widget="skuShelfGoods"])';
+  const CARD = SURFACE + ' .tile-root';
+  const deliveryPanels = new Map();
   const panels = new Map(), cards = new Map(), grids = new Set(), dirty = new Set([document]);
   let context, values = ['', '5', '', ''], draft, focus, frame, timer, serial = 0;
+  let freshOnly = false;
+  try { freshOnly = sessionStorage.getItem(ID + '-fresh-only') === 'true'; } catch {}
   const style = document.createElement('style');
   style.id = ID + '-style';
   style.textContent = `
@@ -32,6 +36,14 @@
     [data-ozr] [data-ozr-error]:empty{display:none}
     [data-ozr-empty]{box-sizing:border-box;padding:32px 24px;color:var(--textSecondary,#707f8d);font:inherit}
     [data-ozr-empty][hidden]{display:none}
+    [data-ozr-delivery]{margin:16px 0;max-width:320px;color:var(--textPrimary,#001a34);font:inherit}
+    [data-ozr-delivery] label{display:flex;align-items:center;justify-content:space-between;gap:16px;position:relative;cursor:pointer;min-height:32px;font-size:16px;line-height:24px;font-weight:700}
+    [data-ozr-delivery] input{position:absolute;right:0;top:50%;transform:translateY(-50%);width:44px;height:28px;margin:0;opacity:0;cursor:pointer}
+    [data-ozr-switch]{display:block;flex:0 0 44px;height:28px;border-radius:16px;background:var(--bgControlSecondary,#dfe5ef);pointer-events:none}
+    [data-ozr-switch]::after{content:"";display:block;width:24px;height:24px;margin:2px;border-radius:50%;background:#fff}
+    [data-ozr-delivery] input:checked + [data-ozr-switch]{background:var(--bgActionPrimary,#005bff)}
+    [data-ozr-delivery] input:checked + [data-ozr-switch]::after{transform:translateX(16px)}
+    [data-ozr-delivery] input:focus-visible + [data-ozr-switch]{outline:2px solid var(--bgActionPrimary,#005bff);outline-offset:3px}
   `;
   document.head.append(style);
   const empty = document.createElement('div');
@@ -51,6 +63,69 @@
 
   function save() {
     try { sessionStorage.setItem(ID, JSON.stringify({ context, values })); } catch {}
+  }
+
+  function isFresh() {
+    const url = new URL(location.href);
+    if (/^\/(?:product|cart|my)(?:\/|$)/.test(url.pathname)) return false;
+    return url.searchParams.get('miniapp') === 'supermarket'
+      || url.pathname === '/category/supermarket-25000/'
+      || !!document.querySelector('[data-widget="searchBarDesktop"] [title="Ozon fresh"]');
+  }
+
+  function mountDelivery() {
+    const anchors = new Map();
+    if (isFresh()) {
+      for (const widget of document.querySelectorAll('[data-widget="filtersDesktop"]')) {
+        const panel = [...panels.values()].find(p => p.offset === 2 && p.root.isConnected && widget.contains(p.root));
+        anchors.set(panel?.root || widget, !panel);
+      }
+      if (!anchors.size) {
+        const header = document.querySelector('[data-widget="resultsHeader"]');
+        if (header) anchors.set(header, false);
+      }
+    }
+    for (const [root, panel] of deliveryPanels) {
+      if (!root.isConnected || !anchors.has(panel.anchor)) {
+        root.remove();
+        deliveryPanels.delete(root);
+      }
+    }
+    for (const [anchor, prepend] of anchors) {
+      if ([...deliveryPanels.values()].some(p => p.anchor === anchor)) continue;
+      const root = document.createElement('div');
+      root.dataset.ozr = '';
+      root.dataset.ozrDelivery = '';
+      const label = document.createElement('label');
+      const title = document.createElement('span');
+      title.textContent = 'За 30 минут';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.setAttribute('role', 'switch');
+      input.checked = freshOnly;
+      const track = document.createElement('span');
+      track.dataset.ozrSwitch = '';
+      track.setAttribute('aria-hidden', 'true');
+      label.title = 'Показывать только товары с меткой «За 30 минут». Итоговые доставки определяет Ozon в корзине.';
+      label.append(title, input, track);
+      root.append(label);
+      input.addEventListener('change', () => {
+        freshOnly = input.checked;
+        try { sessionStorage.setItem(ID + '-fresh-only', String(freshOnly)); } catch {}
+        for (const panel of deliveryPanels.values()) panel.input.checked = freshOnly;
+        schedule(document);
+      });
+      deliveryPanels.set(root, { anchor, input });
+      if (prepend) anchor.prepend(root);
+      else anchor.after(root);
+    }
+  }
+
+  function hasFastDelivery(card) {
+    return [...card.querySelectorAll('button, [role="button"]')].some(button => {
+      const text = button.textContent.replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+      return /^за 30 мин(?:ут)?\.?$/i.test(text);
+    });
   }
 
   function syncContext() {
@@ -260,15 +335,17 @@
         reviewFound = true;
       }
     }
-    return { rating, reviews: !reviewFound && Number.isNaN(rating) ? 0 : reviews, grid: card.closest(GRID) };
+    return { rating, reviews: !reviewFound && Number.isNaN(rating) ? 0 : reviews, fast: hasFastDelivery(card), grid: card.closest(SURFACE) };
   }
 
   function apply() {
     const [lo, hi, min, max] = values.map(parse);
     const rated = lo > 0 || hi < 5, reviewed = min > 0 || max < Infinity;
-    const active = rated || reviewed;
+    const delivery = freshOnly && isFresh();
+    const active = rated || reviewed || delivery;
+    const filtersGrid = grid => delivery || grid.matches(GRID) && (rated || reviewed);
     for (const grid of grids) {
-      if (!active || !grid.isConnected) {
+      if (!filtersGrid(grid) || !grid.isConnected) {
         grid.removeAttribute('data-ozr-grid');
         grid.style.removeProperty('--ozr-height');
         grids.delete(grid);
@@ -276,25 +353,28 @@
     }
     const heights = new Map();
     for (const [card, { grid }] of cards) {
-      if (!card.isConnected) { cards.delete(card); continue; }
-      if (active && !grids.has(grid) && !heights.has(grid)) heights.set(grid, Math.ceil(grid.getBoundingClientRect().height));
+      if (!card.isConnected || !card.matches(CARD)) { card.removeAttribute('data-ozr-hidden'); cards.delete(card); continue; }
+      if (filtersGrid(grid) && !grids.has(grid) && !heights.has(grid)) heights.set(grid, Math.ceil(grid.getBoundingClientRect().height));
     }
     for (const [grid, height] of heights) {
       grid.style.setProperty('--ozr-height', height + 'px');
       grid.setAttribute('data-ozr-grid', '');
       grids.add(grid);
     }
-    let shown = 0;
-    for (const [card, { rating, reviews }] of cards) {
-      const hide = rated && !(rating >= lo && rating <= hi) || reviewed && !(reviews >= min && reviews <= max);
+    let shown = 0, total = 0, first;
+    for (const [card, { rating, reviews, fast, grid }] of cards) {
+      const hide = delivery && !fast || grid.matches(GRID) && (rated && !(rating >= lo && rating <= hi) || reviewed && !(reviews >= min && reviews <= max));
       if (card.hasAttribute('data-ozr-hidden') !== hide) card.toggleAttribute('data-ozr-hidden', hide);
-      if (!hide) shown++;
+      if (filtersGrid(grid)) {
+        total++;
+        first ||= grid;
+        if (!hide) shown++;
+      }
     }
-    empty.hidden = !active || !!shown || !cards.size;
+    empty.hidden = !active || !!shown || !total;
     if (!empty.hidden) {
-      const first = cards.keys().next().value.closest(GRID);
       if (empty.nextElementSibling !== first) first.before(empty);
-      const text = 'Среди загруженных товаров нет подходящих под фильтры. Измените диапазоны или прокрутите ниже, чтобы загрузить ещё.';
+      const text = 'Среди загруженных товаров нет подходящих под фильтры. Измените фильтры или прокрутите ниже, чтобы загрузить ещё.';
       if (empty.textContent !== text) empty.textContent = text;
     }
   }
@@ -316,6 +396,7 @@
       scan(scope, CARD, card => cards.set(card, metrics(card)));
     }
     dirty.clear();
+    mountDelivery();
     apply();
   }
 
@@ -334,7 +415,7 @@
       if (widget) schedule(widget);
       else if (card) schedule(card);
       else for (const node of record.addedNodes) if (node.nodeType === 1) schedule(node);
-      if (record.removedNodes.length && (target.closest(GRID) || [...panels.values()].some(p => !p.root.isConnected))) schedule(target);
+      if (record.removedNodes.length && (target.closest(SURFACE) || [...panels.values()].some(p => !p.root.isConnected) || [...deliveryPanels.keys()].some(root => !root.isConnected))) schedule(target);
     }
   }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['disabled', 'readonly'] });
   addEventListener('popstate', () => schedule(document));
