@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ozon - Rating and Review Filters
 // @namespace    https://github.com/sashokey/ozon-search
-// @version      1.1.0
+// @version      1.1.1
 // @description  Adds rating and review ranges and a 30-minute delivery switch for Ozon Fresh. Filters loaded and newly loaded products.
 // @match        https://www.ozon.ru/*
 // @match        https://ozon.ru/*
@@ -17,9 +17,9 @@
   if (document.getElementById(ID + '-style')) return;
   const PRICE = '[filter-key="currency_price"], [filterkey="currency_price"]';
   const GRID = '[data-widget="tileGridDesktop"]';
-  const SURFACE = ':is(' + GRID + ', [data-widget="skuShelfGoods"])';
-  const CARD = SURFACE + ' .tile-root';
+  const CARD = GRID + ' .tile-root';
   const deliveryPanels = new Map();
+  const knownDelivery = new Map(), pendingCart = new Map(), measureGrids = new Set();
   const panels = new Map(), cards = new Map(), grids = new Set(), dirty = new Set([document]);
   let context, values = ['', '5', '', ''], draft, focus, frame, timer, serial = 0;
   let freshOnly = false;
@@ -36,10 +36,10 @@
     [data-ozr] [data-ozr-error]:empty{display:none}
     [data-ozr-empty]{box-sizing:border-box;padding:32px 24px;color:var(--textSecondary,#707f8d);font:inherit}
     [data-ozr-empty][hidden]{display:none}
-    [data-ozr-delivery]{margin:16px 0;max-width:320px;color:var(--textPrimary,#001a34);font:inherit}
-    [data-ozr-delivery] label{display:flex;align-items:center;justify-content:space-between;gap:16px;position:relative;cursor:pointer;min-height:32px;font-size:16px;line-height:24px;font-weight:700}
+    [data-ozr-delivery]{display:block;box-sizing:border-box;flex:0 0 100%;width:100%;min-width:0;margin:0 0 24px;color:var(--ozTextPrimary,#001a34);font:inherit}
+    [data-ozr-delivery] label{display:flex;box-sizing:border-box;align-items:center;justify-content:space-between;gap:16px;width:100%;margin:0;padding:0;position:relative;cursor:pointer;min-height:32px;color:inherit;font-family:inherit;font-size:16px;line-height:20px;font-weight:600}
     [data-ozr-delivery] input{position:absolute;right:0;top:50%;transform:translateY(-50%);width:44px;height:28px;margin:0;opacity:0;cursor:pointer}
-    [data-ozr-switch]{display:block;flex:0 0 44px;height:28px;border-radius:16px;background:var(--bgControlSecondary,#dfe5ef);pointer-events:none}
+    [data-ozr-switch]{display:block;box-sizing:content-box;flex:0 0 44px;width:44px;height:28px;margin:2px 0;border-radius:16px;background:var(--graphicNeutral,#dfe5ef);pointer-events:none}
     [data-ozr-switch]::after{content:"";display:block;width:24px;height:24px;margin:2px;border-radius:50%;background:#fff}
     [data-ozr-delivery] input:checked + [data-ozr-switch]{background:var(--bgActionPrimary,#005bff)}
     [data-ozr-delivery] input:checked + [data-ozr-switch]::after{transform:translateX(16px)}
@@ -80,10 +80,6 @@
         const panel = [...panels.values()].find(p => p.offset === 2 && p.root.isConnected && widget.contains(p.root));
         anchors.set(panel?.root || widget, !panel);
       }
-      if (!anchors.size) {
-        const header = document.querySelector('[data-widget="resultsHeader"]');
-        if (header) anchors.set(header, false);
-      }
     }
     for (const [root, panel] of deliveryPanels) {
       if (!root.isConnected || !anchors.has(panel.anchor)) {
@@ -121,11 +117,57 @@
     }
   }
 
-  function hasFastDelivery(card) {
-    return [...card.querySelectorAll('button, [role="button"]')].some(button => {
-      const text = button.textContent.replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
-      return /^за 30 мин(?:ут)?\.?$/i.test(text);
+  function normalizedText(element) {
+    return element.textContent.replace(/[\u200b-\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function productKey(card) {
+    const link = card.querySelector('a[href*="/product/"]');
+    if (!link) return '';
+    try { return new URL(link.getAttribute('href'), location.href).pathname.match(/\/product\/(?:[^/]*-)?(\d+)\/?$/)?.[1] || ''; } catch { return ''; }
+  }
+
+  function deliveryLabel(card) {
+    let fast = null;
+    for (const button of card.querySelectorAll('button, [role="button"]')) {
+      let hidden = false;
+      for (let node = button; node && node !== card; node = node.parentElement) {
+        const css = getComputedStyle(node);
+        if (node.hidden || node.getAttribute('aria-hidden') === 'true' || css.display === 'none' || css.visibility === 'hidden') { hidden = true; break; }
+      }
+      if (hidden) continue;
+      const text = normalizedText(button);
+      if (!/^(?:за\s|через\s|(?:сегодня|завтра|послезавтра)(?:\s|$))/i.test(text)) continue;
+      if (!/^за 30 мин(?:ут)?\.?$/i.test(text)) return false;
+      fast = true;
+    }
+    return fast;
+  }
+
+  function hasQuantity(card) {
+    return [...card.querySelectorAll('button')].some(button => {
+      const parent = button.parentElement;
+      return /^\d+$/.test(normalizedText(parent)) && Number(normalizedText(parent)) > 0
+        && parent.querySelectorAll('button').length === 2
+        && !!parent.querySelector('svg path[d^="M13.416 6.75"]')
+        && !!parent.querySelector('svg path[d^="M8 1.333"]');
     });
+  }
+
+  function captureCart(event) {
+    const button = event.target.closest?.('button, [role="button"]');
+    const card = button?.closest(CARD);
+    if (!card || !/^за 30 мин(?:ут)?\.?$/i.test(normalizedText(button))) return;
+    const key = productKey(card);
+    if (!key || deliveryLabel(card) !== true) return;
+    knownDelivery.set(key, true);
+    const deadline = Date.now() + 8000;
+    pendingCart.set(key, deadline);
+    setTimeout(() => {
+      if (pendingCart.get(key) !== deadline) return;
+      pendingCart.delete(key);
+      schedule(document);
+    }, 8000);
   }
 
   function syncContext() {
@@ -133,6 +175,9 @@
     const next = url.pathname + '?' + ['text', 'miniapp'].map(k => url.searchParams.get(k) || '').join('&');
     if (context === next) return;
     context = next;
+    knownDelivery.clear();
+    pendingCart.clear();
+    dirty.add(document);
     draft = focus = null;
     values = ['', '5', '', ''];
     try {
@@ -145,7 +190,6 @@
     } catch {}
     clearTimeout(timer);
     for (const panel of panels.values()) restore(panel);
-    apply();
   }
 
   function paint(panel) {
@@ -335,17 +379,18 @@
         reviewFound = true;
       }
     }
-    return { rating, reviews: !reviewFound && Number.isNaN(rating) ? 0 : reviews, fast: hasFastDelivery(card), grid: card.closest(SURFACE) };
+    const key = productKey(card), delivery = deliveryLabel(card);
+    if (key && delivery !== null) knownDelivery.set(key, delivery);
+    return { rating, reviews: !reviewFound && Number.isNaN(rating) ? 0 : reviews, key, delivery, quantity: hasQuantity(card), grid: card.closest(GRID) };
   }
 
   function apply() {
     const [lo, hi, min, max] = values.map(parse);
     const rated = lo > 0 || hi < 5, reviewed = min > 0 || max < Infinity;
-    const delivery = freshOnly && isFresh();
+    const delivery = freshOnly && isFresh() && deliveryPanels.size > 0;
     const active = rated || reviewed || delivery;
-    const filtersGrid = grid => delivery || grid.matches(GRID) && (rated || reviewed);
     for (const grid of grids) {
-      if (!filtersGrid(grid) || !grid.isConnected) {
+      if (!active || !grid.isConnected) {
         grid.removeAttribute('data-ozr-grid');
         grid.style.removeProperty('--ozr-height');
         grids.delete(grid);
@@ -353,8 +398,16 @@
     }
     const heights = new Map();
     for (const [card, { grid }] of cards) {
-      if (!card.isConnected || !card.matches(CARD)) { card.removeAttribute('data-ozr-hidden'); cards.delete(card); continue; }
-      if (filtersGrid(grid) && !grids.has(grid) && !heights.has(grid)) heights.set(grid, Math.ceil(grid.getBoundingClientRect().height));
+      if (!card.isConnected || !card.matches(CARD)) { card.removeAttribute('data-ozr-hidden'); cards.delete(card); measureGrids.add(grid); continue; }
+      if (active && (!grids.has(grid) || measureGrids.has(grid))) heights.set(grid, 0);
+    }
+    for (const [card, { grid }] of cards) {
+      if (heights.has(grid)) card.removeAttribute('data-ozr-hidden');
+    }
+    for (const grid of heights.keys()) {
+      grid.removeAttribute('data-ozr-grid');
+      grid.style.removeProperty('--ozr-height');
+      heights.set(grid, Math.ceil(grid.getBoundingClientRect().height));
     }
     for (const [grid, height] of heights) {
       grid.style.setProperty('--ozr-height', height + 'px');
@@ -362,10 +415,12 @@
       grids.add(grid);
     }
     let shown = 0, total = 0, first;
-    for (const [card, { rating, reviews, fast, grid }] of cards) {
-      const hide = delivery && !fast || grid.matches(GRID) && (rated && !(rating >= lo && rating <= hi) || reviewed && !(reviews >= min && reviews <= max));
+    measureGrids.clear();
+    for (const [card, { rating, reviews, key, delivery: label, quantity, grid }] of cards) {
+      const fast = label === true || label === null && knownDelivery.get(key) === true && (quantity || (pendingCart.get(key) || 0) > Date.now());
+      const hide = delivery && !fast || rated && !(rating >= lo && rating <= hi) || reviewed && !(reviews >= min && reviews <= max);
       if (card.hasAttribute('data-ozr-hidden') !== hide) card.toggleAttribute('data-ozr-hidden', hide);
-      if (filtersGrid(grid)) {
+      if (active) {
         total++;
         first ||= grid;
         if (!hide) shown++;
@@ -393,7 +448,14 @@
     for (const scope of dirty) {
       if (scope !== document && !scope.isConnected) continue;
       scan(scope, PRICE, mount);
-      scan(scope, CARD, card => cards.set(card, metrics(card)));
+      scan(scope, CARD, card => {
+        const previous = cards.get(card), next = metrics(card);
+        if (!previous || previous.grid !== next.grid) {
+          measureGrids.add(next.grid);
+          if (previous) measureGrids.add(previous.grid);
+        }
+        cards.set(card, next);
+      });
     }
     dirty.clear();
     mountDelivery();
@@ -406,6 +468,7 @@
   }
 
   for (const name of ['input', 'focusin', 'focusout', 'keydown', 'click']) document.addEventListener(name, onEvent);
+  document.addEventListener('click', captureCart, true);
   new MutationObserver(records => {
     for (const record of records) {
       const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
@@ -415,9 +478,19 @@
       if (widget) schedule(widget);
       else if (card) schedule(card);
       else for (const node of record.addedNodes) if (node.nodeType === 1) schedule(node);
-      if (record.removedNodes.length && (target.closest(SURFACE) || [...panels.values()].some(p => !p.root.isConnected) || [...deliveryPanels.keys()].some(root => !root.isConnected))) schedule(target);
+      if (record.removedNodes.length && (target.closest(GRID) || [...panels.values()].some(p => !p.root.isConnected) || [...deliveryPanels.keys()].some(root => !root.isConnected))) schedule(target);
     }
-  }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['disabled', 'readonly'] });
+  }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['disabled', 'readonly', 'href', 'hidden', 'aria-hidden', 'style'] });
   addEventListener('popstate', () => schedule(document));
+  addEventListener('resize', () => {
+    for (const grid of grids) measureGrids.add(grid);
+    schedule(document);
+  });
+  let lastUrl = location.href;
+  setInterval(() => {
+    if (location.href === lastUrl) return;
+    lastUrl = location.href;
+    schedule(document);
+  }, 500);
   flush();
 })();
