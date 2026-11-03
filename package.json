@@ -1,0 +1,30 @@
+{
+  "name": "ozon-search",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "build": "npm run typecheck && node tools/build.ts",
+    "check:build": "npm run typecheck && node tools/build.ts --check",
+    "test": "node --test tests/*.test.ts",
+    "pretest": "npm run check:build",
+    "check": "npm run lint && npm test && npm run test:sensitivity",
+    "test:sensitivity": "node tools/check-test-sensitivity.ts",
+    "check:syntax": "node tools/build.ts --check"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@violentmonkey/types": "0.3.4",
+    "esbuild": "0.28.2",
+    "eslint": "10.14.0",
+    "jiti": "2.7.0",
+    "playwright": "1.62.1",
+    "terser": "5.51.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "@types/firefox-webext-browser": "143.0.0",
+    "chrome-types": "0.1.461",
+    "user-agent-data-types": "0.4.2"
+  }
+}
